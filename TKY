@@ -1,0 +1,411 @@
+// Put this file under: app/src/main/java/com/example/screenblur/MainActivity.kt
+package com.example.screenblur
+
+import android.app.*
+import android.content.Context
+import android.content.Intent
+import android.graphics.*
+import android.media.Image
+import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.net.Uri
+import android.os.*
+import android.provider.Settings
+import android.util.Log
+import android.view.*
+import android.widget.Button
+import android.widget.FrameLayout
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.face.FaceDetection
+import com.google.mlkit.vision.face.FaceDetectorOptions
+import java.nio.ByteBuffer
+import kotlin.concurrent.thread
+
+/**
+ * Single-file prototype:
+ * - MainActivity: UI to request overlay permission and MediaProjection permission
+ * - CaptureService: MediaProjection -> ImageReader -> ML Kit face detection -> send boxes to OverlayService
+ * - OverlayService: draws blurred regions over screen
+ * - Utilities: Image->Bitmap conversion, Blur util (RenderEffect for API>=31, fallback simple blur)
+ *
+ * This is a simplified proof-of-concept. Tweak for production (image formats, memory, performance).
+ */
+
+class MainActivity : AppCompatActivity() {
+
+    private val TAG = "MainActivity"
+
+    private val startForResult =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == Activity.RESULT_OK) {
+                val mpIntent = result.data
+                val svc = Intent(this, CaptureService::class.java)
+                svc.putExtra("resultCode", result.resultCode)
+                svc.putExtra("mediaProjectionIntent", mpIntent)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(svc)
+                } else {
+                    startService(svc)
+                }
+                // also ensure overlay service is started
+                val o = Intent(this, OverlayService::class.java)
+                startService(o)
+                Toast.makeText(this, "Capture and overlay started", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this, "MediaProjection permission denied", Toast.LENGTH_LONG).show()
+            }
+        }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        // Simple UI programmatically to keep single file small
+        val root = FrameLayout(this)
+        val btnOverlay = Button(this).apply { text = "Grant Overlay Permission" }
+        val btnStart = Button(this).apply { text = "Start Capture"; translationY = 200f }
+
+        root.addView(btnOverlay, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply { gravity = Gravity.CENTER_HORIZONTAL or Gravity.TOP; topMargin = 200 })
+
+        root.addView(btnStart, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply { gravity = Gravity.CENTER_HORIZONTAL or Gravity.TOP; topMargin = 400 })
+
+        setContentView(root)
+
+        btnOverlay.setOnClickListener {
+            if (!Settings.canDrawOverlays(this)) {
+                val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+                startActivity(intent)
+            } else {
+                Toast.makeText(this, "Overlay permission already granted", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        btnStart.setOnClickListener {
+            if (!Settings.canDrawOverlays(this)) {
+                Toast.makeText(this, "Please grant overlay permission first", Toast.LENGTH_LONG).show()
+                return@setOnClickListener
+            }
+            val pm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            startForResult.launch(pm.createScreenCaptureIntent())
+        }
+    }
+}
+
+/* ========================= CaptureService =========================
+   Service that uses MediaProjection + ImageReader to capture screen frames,
+   runs ML Kit FaceDetection on downscaled frames, and sends bounding boxes
+   to OverlayService via OverlayIPC (simple static holder).
+ */
+class CaptureService : Service() {
+
+    private val TAG = "CaptureService"
+    private var projection: MediaProjection? = null
+    private var imageReader: ImageReader? = null
+    private var virtualDisplay: android.hardware.display.VirtualDisplay? = null
+    private var backgroundThread: HandlerThread? = null
+    private var backgroundHandler: Handler? = null
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onCreate() {
+        super.onCreate()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        startForegroundWithNotification()
+        try {
+            val resultCode = intent?.getIntExtra("resultCode", Activity.RESULT_CANCELED) ?: Activity.RESULT_CANCELED
+            val mpIntent = intent?.getParcelableExtra<Intent>("mediaProjectionIntent")
+            if (mpIntent != null && resultCode == Activity.RESULT_OK) {
+                val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                projection = mgr.getMediaProjection(resultCode, mpIntent)
+                startCapture()
+            } else {
+                Log.e(TAG, "No MediaProjection intent provided")
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "start error: ${t.message}")
+        }
+        return START_STICKY
+    }
+
+    private fun startForegroundWithNotification() {
+        val chId = "capture_fg"
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(chId, "Capture", NotificationManager.IMPORTANCE_LOW)
+            nm.createNotificationChannel(ch)
+        }
+        val n = Notification.Builder(this, chId)
+            .setContentTitle("Screen Blur Active")
+            .setContentText("Detecting faces and blurring")
+            .setSmallIcon(android.R.drawable.ic_menu_camera)
+            .build()
+        startForeground(101, n)
+    }
+
+    private fun startCapture() {
+        val metrics = resources.displayMetrics
+        val width = metrics.widthPixels
+        val height = metrics.heightPixels
+        val density = metrics.densityDpi
+
+        imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+
+        backgroundThread = HandlerThread("CaptureThread").also { it.start() }
+        backgroundHandler = Handler(backgroundThread!!.looper)
+
+        virtualDisplay = projection?.createVirtualDisplay(
+            "ScreenCapture",
+            width, height, density,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            imageReader?.surface, null, backgroundHandler
+        )
+
+        val realTimeOpts = FaceDetectorOptions.Builder()
+            .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+            .enableTracking()
+            .build()
+        val detector = FaceDetection.getClient(realTimeOpts)
+
+        imageReader?.setOnImageAvailableListener({ reader ->
+            val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+            try {
+                // Convert to Bitmap (RGBA_8888 assumed). For YUV format handle conversion properly.
+                val bmp = ImageUtil.imageToBitmap(image)
+                // Downscale to speed up detection
+                val small = Bitmap.createScaledBitmap(bmp, maxOf(1, bmp.width / 3), maxOf(1, bmp.height / 3), true)
+                val input = InputImage.fromBitmap(small, 0)
+                detector.process(input)
+                    .addOnSuccessListener { faces ->
+                        if (faces.isNotEmpty()) {
+                            // Map boxes back to full resolution
+                            val sx = bmp.width.toFloat() / small.width.toFloat()
+                            val sy = bmp.height.toFloat() / small.height.toFloat()
+                            val boxes = faces.map { f ->
+                                Rect(
+                                    (f.boundingBox.left * sx).toInt(),
+                                    (f.boundingBox.top * sy).toInt(),
+                                    (f.boundingBox.right * sx).toInt(),
+                                    (f.boundingBox.bottom * sy).toInt()
+                                )
+                            }
+                            // Exclude certain apps (simple best-effort)
+                            val fg = ForegroundUtil.getForegroundPackage(this)
+                            if (fg != null && (fg.contains("com.whatsapp") || fg.contains("gallery") || fg.contains("com.google.android.apps.photos"))) {
+                                // Skip overlay for excluded packages
+                            } else {
+                                // Send original bitmap + boxes (careful: large bitmap)
+                                OverlayIPC.queueUpdate(bmp, boxes)
+                                // Do NOT recycle bmp here because overlay may use it; OverlayService should copy as needed.
+                            }
+                        } else {
+                            bmp.recycle()
+                        }
+                        small.recycle()
+                    }
+                    .addOnFailureListener { e ->
+                        Log.e(TAG, "Face detect failed: ${e.message}")
+                        bmp.recycle()
+                    }
+            } catch (t: Throwable) {
+                Log.e(TAG, "Image processing error: ${t.message}")
+                try { image.close() } catch (_: Exception) {}
+            } finally {
+                try { image.close() } catch (_: Exception) {}
+            }
+        }, backgroundHandler)
+    }
+
+    override fun onDestroy() {
+        virtualDisplay?.release()
+        imageReader?.close()
+        projection?.stop()
+        backgroundThread?.quitSafely()
+        super.onDestroy()
+    }
+}
+
+/* ========================= OverlayService =========================
+   Displays a system overlay and draws blurred bitmaps for provided regions.
+   Uses a static holder OverlayIPC to receive updates (prototype).
+*/
+class OverlayService : Service() {
+
+    private var wm: WindowManager? = null
+    private var view: OverlayView? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        view = OverlayView(this)
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            else WindowManager.LayoutParams.TYPE_PHONE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        )
+        params.gravity = Gravity.TOP or Gravity.START
+        wm?.addView(view, params)
+        OverlayIPC.registerService(this)
+    }
+
+    override fun onDestroy() {
+        OverlayIPC.unregisterService()
+        view?.let { wm?.removeView(it) }
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    fun update(bitmap: Bitmap, boxes: List<Rect>) {
+        view?.setData(bitmap, boxes)
+    }
+
+    class OverlayView(context: Context) : FrameLayout(context) {
+        private var bmp: Bitmap? = null
+        private var boxes: List<Rect> = emptyList()
+        private val paint = Paint()
+
+        init { setWillNotDraw(false) }
+
+        fun setData(bitmap: Bitmap, b: List<Rect>) {
+            // Make a copy of bitmap reference (caller may recycle). For memory, consider using scaled copy.
+            bmp?.recycle()
+            bmp = bitmap.copy(Bitmap.Config.ARGB_8888, false)
+            boxes = b
+            postInvalidate()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val localBmp = bmp ?: return
+            for (r in boxes) {
+                try {
+                    val left = r.left.coerceAtLeast(0)
+                    val top = r.top.coerceAtLeast(0)
+                    val right = r.right.coerceAtMost(localBmp.width)
+                    val bottom = r.bottom.coerceAtMost(localBmp.height)
+                    val w = right - left
+                    val h = bottom - top
+                    if (w <= 0 || h <= 0) continue
+                    val region = Bitmap.createBitmap(localBmp, left, top, w, h)
+                    val blurred = BlurUtil.blur(region, 18)
+                    canvas.drawBitmap(blurred, left.toFloat(), top.toFloat(), paint)
+                    region.recycle()
+                    blurred.recycle()
+                } catch (e: Exception) { /* ignore per-region errors */ }
+            }
+        }
+    }
+}
+
+/* ========================= OverlayIPC =========================
+   Simplified static holder to pass updates from CaptureService to OverlayService.
+   Production: use Messenger/Binder/LocalBroadcast/Flow etc.
+*/
+object OverlayIPC {
+    @Volatile private var service: OverlayService? = null
+
+    fun registerService(s: OverlayService) { service = s }
+    fun unregisterService() { service = null }
+
+    fun queueUpdate(bitmap: Bitmap, boxes: List<Rect>) {
+        // Run on main thread to call overlay update
+        val svc = service
+        if (svc != null) {
+            val main = Handler(Looper.getMainLooper())
+            main.post {
+                svc.update(bitmap, boxes)
+            }
+        } else {
+            // Service not ready; recycle the bitmap to avoid leak
+            bitmap.recycle()
+        }
+    }
+}
+
+/* ========================= ImageUtil =========================
+   Convert Image (from ImageReader) to Bitmap.
+   This simplified converter assumes PixelFormat.RGBA_8888 from ImageReader.
+   For YUV_420_888 you must implement proper YUV->RGB conversion.
+*/
+object ImageUtil {
+    fun imageToBitmap(image: Image): Bitmap {
+        // Only handle PixelFormat.RGBA_8888 here (prototype)
+        val plane = image.planes[0]
+        val buffer: ByteBuffer = plane.buffer
+        val width = image.width
+        val height = image.height
+        // Create bitmap with the buffer
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        bitmap.copyPixelsFromBuffer(buffer)
+        return bitmap
+    }
+}
+
+/* ========================= BlurUtil =========================
+   Use RenderEffect on API>=31 for efficient blur. Fallback to a naive fast blur for older APIs.
+   For brevity this includes a very small stack blur fallback (not production-grade).
+*/
+object BlurUtil {
+    fun blur(src: Bitmap, radius: Int): Bitmap {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val out = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
+                val canvas = Canvas(out)
+                val paint = Paint()
+                paint.isAntiAlias = true
+                paint.renderEffect = RenderEffect.createBlurEffect(radius.toFloat(), radius.toFloat(), Shader.TileMode.CLAMP)
+                canvas.drawBitmap(src, 0f, 0f, paint)
+                out
+            } else {
+                // Simple box blur fallback (not high quality). For production include StackBlur or RenderScript alternatives.
+                fastBoxBlur(src, radius)
+            }
+        } catch (e: Throwable) {
+            src
+        }
+    }
+
+    private fun fastBoxBlur(bitmap: Bitmap, radius: Int): Bitmap {
+        // Very small and inefficient blur: scale down -> scale up trick
+        val w = maxOf(1, bitmap.width / 8)
+        val h = maxOf(1, bitmap.height / 8)
+        val small = Bitmap.createScaledBitmap(bitmap, w, h, true)
+        val out = Bitmap.createScaledBitmap(small, bitmap.width, bitmap.height, true)
+        small.recycle()
+        return out
+    }
+}
+
+/* ========================= ForegroundUtil =========================
+   Best-effort foreground package name. On modern Android this may need UsageStats permission.
+   This simple approach uses ActivityManager.getRunningAppProcesses (may not be reliable).
+*/
+object ForegroundUtil {
+    fun getForegroundPackage(ctx: Context): String? {
+        return try {
+            val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val processes = am.runningAppProcesses ?: return null
+            for (p in processes) {
+                if (p.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND) {
+                    return p.processName
+                }
+            }
+            null
+        } catch (t: Throwable) {
+            null
+        }
+    }
+}
